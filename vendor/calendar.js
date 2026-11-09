@@ -3041,6 +3041,12 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
                     cursor: hasEvents ? 'pointer' : 'default',
                     display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'flex-start',
                     boxSizing: 'border-box',
+                    // As wide as its column. On a touch screen a cell is at
+                    // least 40 px tall, and through the square ratio that made
+                    // it 40 px wide too: at 320 the 33 px columns' cells lay
+                    // 3 px over each other. A definite width
+                    // keeps the ratio from widening it; the cell grows taller.
+                    width: '100%',
                     // A grid item is as wide as its content unless told
                     // otherwise: CUYTMDKA.JK and EQMEBKIS-B.ST ran into the
                     // next day at 320-390 px. minWidth alone
@@ -3107,8 +3113,14 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
                       fontSize: 12, fontWeight: 600, padding: '6px 10px',
                     }}>Clear</button>
                   </div>
+                  {/* A day of a month whose feeds did not load is not a day
+                      with no events: the grid above says so, and the day's
+                      panel said "No events on this day" under it. */}
                   {dayEvents.length === 0
-                    ? <div style={{ padding: '16px 0', textAlign: 'center', color: isDark ? C3.textMutedDark : C3.textMutedLight, fontSize: 13 }}>No events on this day</div>
+                    ? <div style={{ padding: '16px 0', textAlign: 'center', color: isDark ? C3.textMutedDark : C3.textMutedLight, fontSize: 13 }}>{loadFailed === 'all'
+                      ? 'Nothing loaded for this day: the feeds above did not load. That is not the same as no events.'
+                      : loadFailed ? `No events on this day in the feeds that loaded. Not loaded: ${failedFeeds.map(f => FEED_NAMES[f] || f).join(', ')}.`
+                      : 'No events on this day'}</div>
                     : (() => {
                       // Every company now stays in the calendar, so a busy
                       // day holds over a thousand: twenty first, like the feed.

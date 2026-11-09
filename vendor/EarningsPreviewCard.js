@@ -83,7 +83,7 @@ window.EarningsPreviewCard = ({ symbol, earningsData, fundamentals, theme, loadC
           if (ctx && ctx.fundamentals) metrics = ctx.fundamentals;
         } catch (_) { /* the preview goes ahead on what the card already had */ }
       }
-      const response = await window.AIService.getEarningsPreview(symbol, quarters, metrics);
+      const response = await window.AIService.getEarningsPreview(symbol, quarters, metrics, window.EarningsMath.nextReportDate(quarters) || nextEarningsDate);
       if (!response || response.trim().length === 0) {
         setError('AI returned an empty response. Please try again.');
       } else {
