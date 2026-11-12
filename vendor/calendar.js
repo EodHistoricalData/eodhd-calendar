@@ -3065,14 +3065,21 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
                     {/* Count badge + symbol preview */}
                     {hasEvents && (
                       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginTop: '2px', gap: '1px', width: '100%', minWidth: 0 }}>
-                        {/* Gradient count badge */}
+                        {/* Gradient count badge. A busy day's four digits ran
+                            1-2 px past a 320 px cell: from 1,000 the count is
+                            "1k+" (the cell's name and the day's panel give it
+                            in full), three digits sit tighter, and the badge
+                            never runs past its cell. */}
                         <div style={{
-                          minWidth: '18px', height: '16px', borderRadius: '8px', padding: '0 4px',
+                          minWidth: '18px', maxWidth: '100%', boxSizing: 'border-box', height: '16px', borderRadius: '8px',
+                          padding: dayEvents.length >= 100 ? '0 2px' : '0 4px',
                           background: C3.logoGradient,
                           display: 'flex', alignItems: 'center', justifyContent: 'center',
                           fontSize: '10px', fontWeight: '700', color: 'white',
+                          letterSpacing: dayEvents.length >= 100 ? '-0.3px' : undefined,
+                          overflow: 'hidden', whiteSpace: 'nowrap',
                         }}>
-                          {dayEvents.length}
+                          {dayEvents.length >= 1000 ? `${Math.floor(dayEvents.length / 1000)}k+` : dayEvents.length}
                         </div>
                         {/* Top event symbol preview */}
                         {dayEvents[0]?.symbol && (
@@ -3103,9 +3110,14 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, gap: 12 }}>
                     <div>
                       <h2 style={{ fontWeight: 700, fontSize: 16, margin: 0, lineHeight: 'normal', color: isDark ? C3.textDark : C3.textLightTheme }}>{dateLabel}</h2>
-                      <div style={{ fontSize: 12, color: isDark ? C3.textMutedDark : C3.textMutedLight, marginTop: 2 }}>
-                        {dayEvents.length} event{dayEvents.length !== 1 ? 's' : ''}
-                      </div>
+                      {/* No count where nothing loaded: "0 events" read as a
+                          day counted empty, above the line that says nothing
+                          came back. */}
+                      {!(dayEvents.length === 0 && loadFailed === 'all') && (
+                        <div style={{ fontSize: 12, color: isDark ? C3.textMutedDark : C3.textMutedLight, marginTop: 2 }}>
+                          {dayEvents.length} event{dayEvents.length !== 1 ? 's' : ''}
+                        </div>
+                      )}
                     </div>
                     <button onClick={clearSelectedDay} style={{
                       background: 'none', border: 'none', cursor: 'pointer',
@@ -3118,7 +3130,9 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
                       panel said "No events on this day" under it. */}
                   {dayEvents.length === 0
                     ? <div style={{ padding: '16px 0', textAlign: 'center', color: isDark ? C3.textMutedDark : C3.textMutedLight, fontSize: 13 }}>{loadFailed === 'all'
-                      ? 'Nothing loaded for this day: the feeds above did not load. That is not the same as no events.'
+                      // One feed is named, in the singular: "the feeds above"
+                      // stood for the one that failed.
+                      ? `Nothing loaded for this day: ${failedFeeds.length === 1 ? `${FEED_NAMES[failedFeeds[0]] || failedFeeds[0]} did not load` : 'the feeds above did not load'}. That is not the same as no events.`
                       : loadFailed ? `No events on this day in the feeds that loaded. Not loaded: ${failedFeeds.map(f => FEED_NAMES[f] || f).join(', ')}.`
                       : 'No events on this day'}</div>
                     : (() => {

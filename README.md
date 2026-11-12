@@ -15,7 +15,7 @@ npm start                 # http://localhost:5173
 ```
 
 Put your EODHD API key in `.env` — [get one here](https://eodhd.com/register?utm_source=eodhd_oss&utm_medium=app&utm_campaign=calendar&utm_content=readme).
-Which of the five calendar feeds a key reaches depends on the plan, and whatever yours lacks is named on screen in EODHD's own words. A first load costs about 90–115 API calls, most of them Screener API pages that rank each day's companies, so the free tier's twenty a day does not cover one. There is no demo mode: without a key the app tells you so
+Which of the five calendar feeds a key reaches depends on the plan (All-In-One, the Fundamentals Data Feed and the Corporate Events Calendar & News Feed carry the calendars), and whatever yours lacks is named on screen in EODHD's own words. A first load costs about 90–115 API calls, most of them Screener API pages that rank each day's companies, so the free tier's twenty a day does not cover one. There is no demo mode: without a key the app tells you so
 and does nothing else.
 
 Tested in current Chrome and Firefox on Node 20 and 24. Other browsers
