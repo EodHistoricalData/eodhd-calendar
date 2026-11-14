@@ -929,8 +929,31 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
   // Frankfurt for every German venue, London, Toronto, Stockholm; ≈ 6 MB),
   // kept in IndexedDB; without them merging works as before.
   const namesRef = React.useRef(null);
-  // The names lists failed and were asked again, NAMES_RETRY_MS, to no avail:
-  // the listings they would place are not shown, and the list says so.
+  // The exchanges whose list did not come, each with why (RateLimitWait
+  // failure): asked again, by themselves, until they do. A list that failed
+  // beside four that answered was said nowhere and never asked again: the
+  // names it would place were missing for good.
+  const namesMissingRef = React.useRef({});
+  // The lists asked and not answered yet: the day is not drawn in full while
+  // one is out, even with every other one in.
+  const namesPendingRef = React.useRef({});
+  // Told when a list fails, as it fails (the load on screen sets it): one
+  // list that hung kept another's known failure unsaid.
+  const namesOnFailRef = React.useRef(null);
+  // Per exchange: the attempts asked, and the attempt whose answer was taken
+  // in last -- an answer after the deadline is taken in when nothing newer
+  // has come for that exchange.
+  const namesAskedGenRef = React.useRef({});
+  const namesTakenGenRef = React.useRef({});
+  // The feeds on screen, each drawn again when a late list completes the
+  // names (collapseInto registers them by feed).
+  const namesRedrawRef = React.useRef({});
+  // Every list is in: what the day is drawn from in full.
+  const namesComplete = () => Boolean(namesRef.current) && !Object.keys(namesMissingRef.current).length
+    && !Object.keys(namesPendingRef.current).length;
+  // The names lists that did not load, and why: { exchanges, fail } while
+  // they are out -- said at once and until they come, while they are asked
+  // again (NAMES_RETRY_MS) and after.
   const [namesProblem, setNamesProblem] = React.useState(false);
   // A retry of the names waits seconds; not after the view is gone.
   const viewAliveRef = React.useRef(true);
@@ -938,40 +961,106 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
   const NAME_EXCHANGES = [['US', { type: 'common_stock' }], ['F'], ['LSE'], ['TO'], ['ST']];
   const namesAskRef = React.useRef(null);
   const loadListingNames = () => {
-    if (namesRef.current) return Promise.resolve(namesRef.current);
+    if (namesComplete()) return Promise.resolve(namesRef.current);
     if (!namesAskRef.current) namesAskRef.current = askListingNames().finally(() => { namesAskRef.current = null; });
     return namesAskRef.current;
   };
+  // The missing lists as the line says them: the exchanges, and the first
+  // one's reason. False when none is missing.
+  const namesMissing = () => {
+    const missing = NAME_EXCHANGES.map(([ex]) => ex).filter(ex => namesMissingRef.current[ex]);
+    return missing.length ? { exchanges: missing, fail: namesMissingRef.current[missing[0]] } : false;
+  };
   const askListingNames = async () => {
     const storeKey = `${keyTag}|names1`;
-    let names = store ? await store.get(storeKey) : null;
-    if (!names || typeof names !== 'object') {
-      const API = window.EODHD_API;
-      const list = async (ex, extra) => {
-        const params = { fmt: 'json', ...(extra || {}) };
-        try {
-          const body = API.needsProxy && API.needsProxy(apiKey) && API._genericProxyFetch
-            ? await API._genericProxyFetch(`exchange-symbol-list/${ex}`, params)
-            : await API._directFetch(`exchange-symbol-list/${ex}`, apiKey, params);
-          return Array.isArray(body) ? body : null;
-        } catch (_) { return null; }
-      };
-      const lists = API && (API._genericProxyFetch || API._directFetch)
-        ? await Promise.all(NAME_EXCHANGES.map(([ex, extra]) => list(ex, extra))) : [];
-      names = {};
-      lists.forEach((rows, i) => {
-        const ex = NAME_EXCHANGES[i][0];
-        (rows || []).forEach((r) => { if (r && r.Code && r.Name) names[`${String(r.Code).toUpperCase()}.${ex}`] = String(r.Name); });
-      });
-      // Kept for the week only when every list answered, and for this view
-      // only when some did: a refused list (a 429 with the feeds) was kept as
-      // "no names" and the day stayed unfolded until the view was opened again.
-      const answered = lists.filter(Array.isArray).length;
-      if (store && answered === NAME_EXCHANGES.length && Object.keys(names).length) store.set(storeKey, names, 7 * 24 * 3600 * 1000, { pastMidnight: true });
-      if (!answered) names = null;
+    const kept = !namesRef.current && store ? await store.get(storeKey) : null;
+    if (kept && typeof kept === 'object') {
+      namesRef.current = kept;
+      namesMissingRef.current = {};
+      return kept;
     }
-    namesRef.current = names;
-    return names;
+    const API = window.EODHD_API;
+    if (!API || !(API._genericProxyFetch || API._directFetch)) return namesRef.current;
+    const RLW = window.RateLimitWait;
+    const list = async (ex, extra) => {
+      const params = { fmt: 'json', ...(extra || {}) };
+      try {
+        const body = API.needsProxy && API.needsProxy(apiKey) && API._genericProxyFetch
+          ? await API._genericProxyFetch(`exchange-symbol-list/${ex}`, params)
+          : await API._directFetch(`exchange-symbol-list/${ex}`, apiKey, params);
+        if (Array.isArray(body)) return { rows: body };
+        return { fail: RLW.failure(body == null ? null : RLW.unreadableError('Unreadable response (exchange-symbol-list)', 200)) };
+      } catch (e) { return { fail: RLW.failure(e || {}) }; }
+    };
+    // A list that hangs ends at its deadline as one that did not answer:
+    // its repeat goes with the others'. Its late answer is
+    // left; the repeat asks again.
+    // An answer after the deadline is not dropped: with every attempt late,
+    // the repeats ran out and the listings stayed hidden though every list
+    // had come. A late list is taken in when
+    // nothing newer has come for its exchange, and the day drawn again.
+    const deadline = window.CALENDAR_NAMES_DEADLINE_MS || 25000;
+    const bounded = (ex, gen, ask) => new Promise((resolve) => {
+      let late = false;
+      const t = setTimeout(() => { late = true; resolve({ fail: RLW.failure({ status: 0 }) }); }, deadline);
+      ask.then((got) => {
+        clearTimeout(t);
+        if (!late) { resolve(got); return; }
+        if (got.rows && takeIn(ex, got, gen)) namesLate();
+      });
+    });
+    // The lists not in yet: all of them the first time, then the ones that
+    // failed. Those that answered are not asked again. Each one is taken in
+    // as it settles, and a failure said at once: read together, one list
+    // that hung kept another's known failure unsaid, with no repeat.
+    const asked = namesRef.current ? NAME_EXCHANGES.filter(([ex]) => namesMissingRef.current[ex]) : NAME_EXCHANGES;
+    asked.forEach(([ex]) => { namesPendingRef.current = { ...namesPendingRef.current, [ex]: true }; });
+    // False when a newer attempt's answer is in already.
+    const takeIn = (ex, got, gen) => {
+      if (gen < (namesTakenGenRef.current[ex] || 0)) return false;
+      namesTakenGenRef.current = { ...namesTakenGenRef.current, [ex]: gen };
+      const pending = { ...namesPendingRef.current };
+      delete pending[ex];
+      namesPendingRef.current = pending;
+      const missing = { ...namesMissingRef.current };
+      if (got.fail) {
+        missing[ex] = got.fail;
+        namesMissingRef.current = missing;
+        if (namesOnFailRef.current) namesOnFailRef.current();
+        return true;
+      }
+      delete missing[ex];
+      namesMissingRef.current = missing;
+      const names = { ...(namesRef.current || {}) };
+      got.rows.forEach((r) => { if (r && r.Code && r.Name) names[`${String(r.Code).toUpperCase()}.${ex}`] = String(r.Name); });
+      namesRef.current = names;
+      return true;
+    };
+    // Kept for the week only when every list answered, and for this view
+    // only when some did: a refused list (a 429 with the feeds) was kept as
+    // "no names" and the day stayed unfolded until the view was opened again.
+    const keepForWeek = () => {
+      const names = namesRef.current || {};
+      if (store && namesComplete() && Object.keys(names).length) store.set(storeKey, names, 7 * 24 * 3600 * 1000, { pastMidnight: true });
+    };
+    // A late list came: the line says what is still missing, or goes and
+    // the feeds on screen are drawn in full.
+    const namesLate = () => {
+      if (!viewAliveRef.current) return;
+      if (!namesComplete()) { setNamesProblem(namesMissing()); return; }
+      keepForWeek();
+      setNamesProblem(false);
+      Object.values(namesRedrawRef.current).forEach((redraw) => { try { redraw(); } catch (_) { /* one feed's trouble */ } });
+    };
+    await Promise.all(asked.map(([ex, extra]) => {
+      const gen = (namesAskedGenRef.current[ex] || 0) + 1;
+      namesAskedGenRef.current = { ...namesAskedGenRef.current, [ex]: gen };
+      return bounded(ex, gen, list(ex, extra)).then(got => takeIn(ex, got, gen));
+    }));
+    keepForWeek();
+    const names = namesRef.current || {};
+    if (!Object.keys(names).length && Object.keys(namesMissingRef.current).length === NAME_EXCHANGES.length) namesRef.current = null;
+    return namesRef.current;
   };
   // Each feed's state for the load on screen: 'loading', 'ok' or 'failed'
   // (with the dividend days that did not answer). One feed hung or refused
@@ -1021,6 +1110,10 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
   // same on every screen).
   const rlWait = window.RateLimitWait.useWait();
   const waitLeft = rlWait.left;
+  // Drawn again when what a host's panel says of the key or the day
+  // changes: the names line and the holidays' refusal line are left out
+  // while it says them, and come back when it clears.
+  window.RateLimitWait.useHostPanel();
 
   // `only`: the feeds a Try again asks for again; the others keep what they
   // have. Without it, everything the filter shows, from the start.
@@ -1132,10 +1225,19 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
       const waits = window.CalendarFormat.NAMES_RETRY_MS || [];
       let tries = 0;
       const wanted = () => viewAliveRef.current && [...namesWanted].some(f => live(f));
+      // A list that fails while others are out is said at once -- one that
+      // failed before this load was listening too.
+      namesOnFailRef.current = () => { if (wanted() && !namesComplete()) setNamesProblem(namesMissing()); };
+      if (Object.keys(namesMissingRef.current).length) namesOnFailRef.current();
       namesWait = new Promise((resolve) => {
         const namesSettled = () => {
           if (!wanted()) { resolve(null); return; }
-          if (namesRef.current) { resolve(true); return; }
+          if (namesComplete()) { resolve(true); return; }
+          // Said as soon as a list fails, with the exchanges and why; the
+          // repeats go on behind it, and the line goes when they come. It
+          // came only once none had answered and the last repeat had failed,
+          // about 65 s in, and never for one exchange.
+          setNamesProblem(namesMissing());
           if (tries >= waits.length) { resolve(false); return; }
           // A 429's own wait when it is longer.
           const until = window.RateLimitWait && window.RateLimitWait.until ? window.RateLimitWait.until() : 0;
@@ -1178,19 +1280,22 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
         const grouped = window.CalendarFormat.collapseListings(rows, capsNow, mergedNames);
         // Until the names are in, no likely second listing. The screener's
         // names, with the caps, are the only ones for Paris, Amsterdam and
-        // the other home exchanges.
-        const folded = toEvents(settled.caps && namesRef.current ? grouped : window.CalendarFormat.withoutLikelyTwins(grouped, capsNow));
+        // the other home exchanges. All of them: with Frankfurt's list
+        // missing beside four that came, APC.XETRA stood beside AAPL.
+        const folded = toEvents(settled.caps && namesComplete() ? grouped : window.CalendarFormat.withoutLikelyTwins(grouped, capsNow));
         return own ? toEvents(own).concat(folded) : folded;
       };
       out.push(...collapse());
       const again = () => { const next = collapse(); out.length = 0; out.push(...next); show(f, next); };
       // Each on its own: a hung names list does not hold the caps back.
       if (!settled.caps) a.caps.then(again);
-      if (!namesRef.current) {
+      if (!namesComplete()) {
         namesWanted.add(f);
+        // Drawn again if a list comes after its deadline and completes them.
+        namesRedrawRef.current = { ...namesRedrawRef.current, [f]: () => { if (viewAliveRef.current && live(f)) again(); } };
         waitForNames().then((got) => {
           if (got === null || !viewAliveRef.current || !live(f)) return;
-          if (got) again(); else setNamesProblem(RLW.failure(null));
+          if (got) { again(); setNamesProblem(false); } else setNamesProblem(namesMissing());
         });
       }
     };
@@ -1602,9 +1707,10 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
             const had = ES.isLoaded ? ES.isLoaded(ex) : false;
             // A Try again asks again over a failure kept from before.
             try { await ES.load(ex, apiKey, only ? { fresh: true } : undefined); } catch (_) {}
-            // A failure is not kept for the day.
+            // A failure is not kept for the day, nor a refusal: a spent day
+            // (402) is over by tomorrow.
             const got = ES.peek ? ES.peek(ex) : null;
-            if (!had && store && got && !got._failed) store.set(storeKey, got, 24 * 3600 * 1000);
+            if (!had && store && got && !got._failed && !got._refused) store.set(storeKey, got, 24 * 3600 * 1000);
             // The window's own days, past ones included: a month paged back
             // showed no holiday at all -- January, opened on 28 Feb, had no
             // New Year's Day -- since only upcoming ones
@@ -1634,7 +1740,17 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
           // A 5xx or a 429 is no answer. An answer
           // that could not be read is said as that.
           if (ES.unreadable && exchanges.some(ex => ES.unreadable(ex))) return { ok: false, fail: RLW.failure(RLW.unreadableError('Unreadable response (exchange-details)', 200)) };
-          return !ES.isLoaded || exchanges.every(ex => ES.isLoaded(ex) && !(ES.failed && ES.failed(ex)));
+          if (!ES.isLoaded) return true;
+          // Why, from the answer (ExchangeStatus.failure): a 500 is EODHD's
+          // error, not "did not answer".
+          const failedEx = exchanges.find(ex => !ES.isLoaded(ex) || (ES.failed && ES.failed(ex)));
+          if (failedEx) return { ok: false, fail: (ES.failure && ES.failure(failedEx)) || RLW.failure(null) };
+          // A refusal (401, 402, 403) is said, with nothing to retry, and never
+          // asked again; its words are read when drawn (ExchangeStatus.
+          // refusalText): a host's own panel may say a 401 or 402 already. In
+          // the terminal, with none, they read as holidays that loaded.
+          const refused = ES.refused ? exchanges.filter(ex => ES.refused(ex)) : [];
+          return refused.length ? { ok: true, refused } : true;
         } catch (e) { console.error('Holidays load error:', e); return false; }
       }));
 
@@ -2383,9 +2499,36 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
     ) : (explainedAbove
       ? 'The feeds named above were not served; the rest have nothing in this window.'
       : "The feeds named above didn't answer; the rest have nothing in this window.");
+  // The empty list's sentence names the holidays' exchange-details itself
+  // when they are the only feed that failed (data-own-fail, for the open
+  // apps' shell); the other feeds are the panel's to explain.
+  const emptyOwnFail = failedFeeds.length === 1 && failedFeeds[0] === 'holidays' ? 'exchange-hours' : undefined;
   // A failed feed's line, and the names lists'.
   const feedLine = (f, what) => `${what || FEED_NAMES[f]} did not load${explainedAbove ? '. See the panel above.' : whyOf(failOf(f))}`;
-  const namesLine = `Company names did not load, so some listings on other exchanges are left out${namesProblem && namesProblem.limited ? " — EODHD's per-minute request limit was reached." : '.'}`;
+  // Which exchanges' names did not load, and why.
+  const namesLine = (() => {
+    // A refused key or a spent day the host's panel says already: no line
+    // (one failure, one message). The terminal has none: said here.
+    if (!namesProblem || RLW.hostSaysKey(namesProblem.fail)) return '';
+    const ex = namesProblem.exchanges || [];
+    const where = ex.length > 1 ? `${ex.slice(0, -1).join(', ')} and ${ex[ex.length - 1]}` : (ex[0] || '');
+    const f = namesProblem.fail;
+    const tail = ', so some listings on other exchanges are left out.';
+    if (f && (f.status === 402 || f.status === 403) && !f.limited && !f.unreadable) return `Company names for ${where} are not included in this plan (${f.status})${tail}`;
+    return `Company names for ${where} did not load: ${RLW.failReason(f).replace(/\.$/, '')}${tail}`;
+  })();
+  // The exchanges' holidays refused (401, 402, 403): an answer, said once
+  // with nothing to retry. One sentence
+  // when every exchange was refused alike, else one per exchange.
+  const holidaysRefused = (feedStatus.holidays && feedStatus.holidays.state === 'ok' && feedStatus.holidays.refused) || [];
+  const holidaysRefusedLine = (() => {
+    const ES = window.ExchangeStatus;
+    if (!holidaysRefused.length || !ES || !ES.refusalText) return '';
+    const all = ['US', 'LSE', 'TO'];
+    const alike = holidaysRefused.length === all.length && holidaysRefused.every(ex => ES.refused(ex) === ES.refused(holidaysRefused[0]));
+    if (alike) return ES.refusalText(holidaysRefused[0], 'Market holidays');
+    return holidaysRefused.map(ex => ES.refusalText(ex, 'Market holidays for ' + ex)).filter(Boolean).join(' ');
+  })();
   // ── One live region for the calendar's failures ──────────────────────
   // Each feed's line, the names line and the empty list's sentence were
   // live regions of their own, and their words followed the wait: about
@@ -2401,6 +2544,7 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
         ? `Dividends for ${st.days.map(dayLabel).join(', ')}` : null);
     }))
     .concat(namesProblem && namesFeeds.length > 0 ? [namesLine] : [])
+    .concat(holidaysRefusedLine ? [holidaysRefusedLine] : [])
     .filter(Boolean).join(' '));
   const [liveSummary, setLiveSummary] = React.useState('');
   React.useEffect(() => {
@@ -2408,7 +2552,7 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
     setLiveSummary(failSummary);
   }, [failSummary]);
   // The wait that stopped a feed is over: said once, as on every screen.
-  const limitShown = failedFeeds.some(f => failOf(f) && failOf(f).limited) || Boolean(namesProblem && namesProblem.limited);
+  const limitShown = failedFeeds.some(f => failOf(f) && failOf(f).limited) || Boolean(namesProblem && namesProblem.fail && namesProblem.fail.limited);
   const waitWasRef = React.useRef(0);
   React.useEffect(() => {
     const was = waitWasRef.current;
@@ -2444,7 +2588,7 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
             const what = f === 'dividends' && st.days && st.days.length && divCoverage && !divCoverage.none
               ? `Dividends for ${st.days.map(dayLabel).join(', ')}` : FEED_NAMES[f];
             return (
-              <div key={f} data-feed-problem={f} style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13, color: mutedInk }}>
+              <div key={f} data-feed-problem={f} data-own-fail={f === 'holidays' ? 'exchange-hours' : undefined} style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13, color: mutedInk }}>
                 {/* Not a live region of its own: the calendar's one
                     (failSummary) reads every feed's line once. */}
                 <span>{feedLine(f, what)}</span>
@@ -2465,8 +2609,8 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
       )}
       {/* The names lists failed after every retry: what is left out, and a
           Try again that asks for them again. */}
-      {namesProblem && namesFeeds.length > 0 && (
-        <div data-names-problem="true" style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13, color: mutedInk }}>
+      {namesLine && namesFeeds.length > 0 && (
+        <div data-names-problem="true" data-own-fail="company-names" style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13, color: mutedInk }}>
           {/* Read out by the calendar's one live region (failSummary). */}
           <span style={{ flex: '1 1 200px', minWidth: 0 }}>{namesLine}</span>
           <button type="button" data-retry-focus="true" aria-disabled={waitLeft ? 'true' : undefined}
@@ -2480,6 +2624,10 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
             {waitLeft ? `Try again in ${waitLeft} s` : 'Try again'}
           </button>
         </div>
+      )}
+      {/* Read out by the calendar's one live region (failSummary). */}
+      {holidaysRefusedLine && (
+        <p data-holidays-refused="true" data-own-fail="exchange-hours" style={{ fontSize: 13, margin: '0 0 12px', color: mutedInk }}>{holidaysRefusedLine}</p>
       )}
       {rlWait.note && !emptyAllFailed && (
         <p data-wait-note="true" style={{ fontSize: 13, margin: '0 0 12px', color: isDark ? C3.textDark : C3.textLightTheme }}>{rlWait.note}</p>
@@ -2806,7 +2954,7 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
               <div style={{ textAlign: 'center', padding: '48px 0' }}>
                 {/* Read out by the calendar's one live region
                     (failSummary); the button below counts the wait. */}
-                <p style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginBottom: '16px', fontSize: '14px' }}>
+                <p data-own-fail={emptyOwnFail} style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginBottom: '16px', fontSize: '14px' }}>
                   {emptyReason}
                 </p>
                 {emptyAllFailed && retryAllButton('12px 24px')}
@@ -2959,7 +3107,7 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
                 feed, not a line per feed. */}
             {emptyAllFailed ? (
               <div data-grid-all-failed="true" style={{ textAlign: 'center', margin: '0 0 12px' }}>
-                <p style={{ fontSize: '13px', margin: '0 0 8px', color: isDark ? C3.textMutedDark : C3.textMutedLight }}>
+                <p data-own-fail={emptyOwnFail} style={{ fontSize: '13px', margin: '0 0 8px', color: isDark ? C3.textMutedDark : C3.textMutedLight }}>
                   {emptyReason}{loadFailed === 'all' && !explainedAbove ? ' Empty days below are not "no events".' : ''}
                 </p>
                 {retryAllButton('8px 18px')}
