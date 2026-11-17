@@ -868,6 +868,17 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
   const US_BANDS = [[1e11, null], [3e10, 1e11], [1e10, 3e10], [4e9, 1e10], [1e8, 4e9]];
   // One asking at a time: a feed's Try again while the first is out joins it.
   const capsAskRef = React.useRef(null);
+  // The screener's pages that did not come, and why: { failure, part,
+  // groups } -- part when some came, one group a reason. Said under the
+  // feeds that order and fold by them (capsLine): a page refused,
+  // unreadable or at 500 went without a word, the reports unordered (the
+  // open apps' failure matrix).
+  const [capsProblem, setCapsProblem] = React.useState(null);
+  // Each page's answer, by page, for this key: the rows that came, the
+  // plan's refusal (403). A Try again asks only the pages that can come:
+  // one page served, the next refused and the rest at 500 read "not
+  // included in this plan" for all of them, with no Try again.
+  const capsPagesRef = React.useRef({ key: null, pages: new Map() });
   const loadCaps = () => {
     if (capsRef.current) return Promise.resolve(capsRef.current);
     if (!capsAskRef.current) capsAskRef.current = askCaps().finally(() => { capsAskRef.current = null; });
@@ -877,18 +888,32 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
     if (window.Entitlement && window.Entitlement.get && window.Entitlement.get('screener').allowed === false) return null;
     const storeKey = `${keyTag}|caps4`;
     let caps = store ? await store.get(storeKey) : null;
+    const RLW = window.RateLimitWait;
+    const fails = [];
+    const kept = capsPagesRef.current;
+    if (kept.key !== String(apiKey)) { kept.key = String(apiKey); kept.pages = new Map(); }
+    const planRefused = (f) => Boolean(f && f.status === 403 && !f.limited && !f.unreadable);
     if (!caps || !caps.caps) {
       caps = null;
       const API = window.EODHD_API;
       const page = async (filters, offset) => {
+        const pk = JSON.stringify(filters) + '@' + offset;
+        const had = kept.pages.get(pk);
+        if (had && had.rows) return had.rows;
+        if (had && planRefused(had.fail)) { fails.push(had.fail); return null; }
         const params = { filters: JSON.stringify(filters), sort: 'market_capitalization.desc', limit: CAP_PAGE, offset };
+        let fail = null;
+        let rows = null;
         try {
           const body = API.needsProxy && API.needsProxy(apiKey)
             ? await API._proxyFetch('screener', params)
             : await API._directFetch('screener', apiKey, params);
-          const rows = Array.isArray(body) ? body : (body && Array.isArray(body.data) ? body.data : null);
-          return rows;
-        } catch (_) { return null; }
+          rows = Array.isArray(body) ? body : (body && Array.isArray(body.data) ? body.data : null);
+          if (!rows) fail = RLW.failure(RLW.unreadableError('Unreadable response (screener)', 200));
+        } catch (e) { fail = RLW.failure(e || {}); }
+        if (rows) kept.pages.set(pk, { rows });
+        else { kept.pages.set(pk, { fail }); fails.push(fail); }
+        return rows;
       };
       // The screener answers 422 past roughly the thousandth row of one
       // query, so offsets 1000 and on were refused and the list stopped at
@@ -914,9 +939,22 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
           ...CAP_EXCHANGES.map(ex => page([['exchange', '=', ex]], 0).then(p => (Array.isArray(p) ? [p] : []))),
         ]);
         caps = window.CalendarFormat.capsFromScreener([].concat(...all));
-        if (store && Object.keys(caps.caps).length) store.set(storeKey, caps, 24 * 3600 * 1000);
+        // Kept for the day only when every page came: a part kept stood
+        // for the whole until midnight.
+        if (store && Object.keys(caps.caps).length && !fails.length) store.set(storeKey, caps, 24 * 3600 * 1000);
       }
     }
+    // One group a reason: the plan's (403), the key or the day under a
+    // host's panel, anything else by its words.
+    const groups = [];
+    fails.forEach((f) => {
+      const kind = planRefused(f) ? 'plan' : RLW.hostSaysKey(f) ? 'panel' : 'why:' + RLW.failReason(f);
+      let g = groups.find(x => x.kind === kind);
+      if (!g) { g = { kind, failure: f }; groups.push(g); }
+      if (f.limited) g.failure = f;
+    });
+    const retryable = fails.filter(f => !planRefused(f));
+    if (viewAliveRef.current) setCapsProblem(fails.length ? { failure: retryable.find(f => f.limited) || retryable[0] || fails[0], part: Boolean(caps), groups } : null);
     capsRef.current = caps || null;
     return capsRef.current;
   };
@@ -945,6 +983,13 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
   // has come for that exchange.
   const namesAskedGenRef = React.useRef({});
   const namesTakenGenRef = React.useRef({});
+  // A list refused (401, 402, 403) is an answer for the key it was asked
+  // with: not asked again while the key is the same. Asked again with each
+  // repeat, a 401 for LSE went out three times in 25 s and the open apps'
+  // panel came and went with each.
+  const namesRefusedRef = React.useRef({});
+  const isRefusal = (f) => Boolean(f && !f.limited && !f.unreadable && (f.status === 401 || f.status === 402 || f.status === 403));
+  const refusedForKey = (ex) => namesRefusedRef.current[ex] === String(apiKey) && isRefusal(namesMissingRef.current[ex]);
   // The feeds on screen, each drawn again when a late list completes the
   // names (collapseInto registers them by feed).
   const namesRedrawRef = React.useRef({});
@@ -960,18 +1005,26 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
   React.useEffect(() => () => { viewAliveRef.current = false; }, []);
   const NAME_EXCHANGES = [['US', { type: 'common_stock' }], ['F'], ['LSE'], ['TO'], ['ST']];
   const namesAskRef = React.useRef(null);
-  const loadListingNames = () => {
+  // The lists were asked once already: a later load asks only those still
+  // missing. Not "names kept": with all five refused there are none, and the
+  // next filter took the first-load branch and asked the five again with the
+  // same key.
+  const namesAskedOnceRef = React.useRef(false);
+  // `only`: the exchanges to ask, else every one still missing.
+  const loadListingNames = (only) => {
     if (namesComplete()) return Promise.resolve(namesRef.current);
-    if (!namesAskRef.current) namesAskRef.current = askListingNames().finally(() => { namesAskRef.current = null; });
+    if (!namesAskRef.current) namesAskRef.current = askListingNames(only).finally(() => { namesAskRef.current = null; });
     return namesAskRef.current;
   };
-  // The missing lists as the line says them: the exchanges, and the first
-  // one's reason. False when none is missing.
+  // The missing lists as the line says them: the exchanges, the first one's
+  // reason, and each one's (`fails`). False when none is missing.
   const namesMissing = () => {
     const missing = NAME_EXCHANGES.map(([ex]) => ex).filter(ex => namesMissingRef.current[ex]);
-    return missing.length ? { exchanges: missing, fail: namesMissingRef.current[missing[0]] } : false;
+    const fails = {};
+    missing.forEach((ex) => { fails[ex] = namesMissingRef.current[ex]; });
+    return missing.length ? { exchanges: missing, fail: namesMissingRef.current[missing[0]], fails } : false;
   };
-  const askListingNames = async () => {
+  const askListingNames = async (only) => {
     const storeKey = `${keyTag}|names1`;
     const kept = !namesRef.current && store ? await store.get(storeKey) : null;
     if (kept && typeof kept === 'object') {
@@ -1013,7 +1066,9 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
     // failed. Those that answered are not asked again. Each one is taken in
     // as it settles, and a failure said at once: read together, one list
     // that hung kept another's known failure unsaid, with no repeat.
-    const asked = namesRef.current ? NAME_EXCHANGES.filter(([ex]) => namesMissingRef.current[ex]) : NAME_EXCHANGES;
+    const asked = (only ? NAME_EXCHANGES.filter(([ex]) => only.indexOf(ex) !== -1)
+      : namesRef.current || namesAskedOnceRef.current ? NAME_EXCHANGES.filter(([ex]) => namesMissingRef.current[ex]) : NAME_EXCHANGES)
+      .filter(([ex]) => !refusedForKey(ex));
     asked.forEach(([ex]) => { namesPendingRef.current = { ...namesPendingRef.current, [ex]: true }; });
     // False when a newer attempt's answer is in already.
     const takeIn = (ex, got, gen) => {
@@ -1026,6 +1081,7 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
       if (got.fail) {
         missing[ex] = got.fail;
         namesMissingRef.current = missing;
+        if (isRefusal(got.fail)) namesRefusedRef.current = { ...namesRefusedRef.current, [ex]: String(apiKey) };
         if (namesOnFailRef.current) namesOnFailRef.current();
         return true;
       }
@@ -1057,6 +1113,7 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
       namesAskedGenRef.current = { ...namesAskedGenRef.current, [ex]: gen };
       return bounded(ex, gen, list(ex, extra)).then(got => takeIn(ex, got, gen));
     }));
+    namesAskedOnceRef.current = true;
     keepForWeek();
     const names = namesRef.current || {};
     if (!Object.keys(names).length && Object.keys(namesMissingRef.current).length === NAME_EXCHANGES.length) namesRef.current = null;
@@ -1069,6 +1126,9 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
   // own Try again, and the list shows whatever did load.
   const FEED_ORDER = ['earnings', 'dividends', 'splits', 'economic', 'holidays', 'ipos'];
   const FEED_NAMES = { earnings: 'Earnings', dividends: 'Dividends', splits: 'Splits', economic: 'Economic events', holidays: 'Market holidays', ipos: 'IPOs' };
+  // The request each feed's line names (data-own-fail), for the open apps'
+  // shell: what a line on the page says itself, the panel leaves to it.
+  const FEED_KIND = { earnings: 'earnings', dividends: 'dividends', splits: 'splits', economic: 'economic-events', holidays: 'exchange-hours', ipos: 'ipos' };
   const feedsFor = (f) => FEED_ORDER.filter(x => f === 'all' || f === x);
   const [feedStatus, setFeedStatus] = React.useState(() => Object.fromEntries(feedsFor(filter).map(f => [f, { state: 'loading' }])));
   // Each feed's events for the load on screen, and which asking of the feed
@@ -1117,7 +1177,9 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
 
   // `only`: the feeds a Try again asks for again; the others keep what they
   // have. Without it, everything the filter shows, from the start.
-  const loadEvents = async (only) => {
+  // opts.capsOnly: the caps' repeat after the limit's wait -- the names are
+  // not asked in it (they have their own one repeat, namesLimited).
+  const loadEvents = async (only, opts) => {
     const reqId = only ? reqIdRef.current : ++reqIdRef.current;
     const wanted = feedsFor(filter).filter(f => !only || only.includes(f));
     if (!wanted.length) return;
@@ -1214,7 +1276,7 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
     let aux = null;
     const askAux = () => aux || (aux = {
       caps: loadCaps().then(() => true, () => true),
-      names: loadListingNames().then(() => true, () => true),
+      names: opts && opts.capsOnly ? Promise.resolve(true) : loadListingNames().then(() => true, () => true),
     });
     // The feeds waiting for the names; the retries stop when none of them is
     // the one on screen any more (a Try again of a feed starts its own).
@@ -1238,13 +1300,19 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
           // came only once none had answered and the last repeat had failed,
           // about 65 s in, and never for one exchange.
           setNamesProblem(namesMissing());
-          if (tries >= waits.length) { resolve(false); return; }
+          // Nothing left to ask but lists this key was refused: no repeat.
+          // A list at the limit (429) is not on this pace either: one repeat
+          // after the wait, by the view's own reload (namesLimited below). Asked again here after every wait, US's
+          // list went out three times (the open apps' failure matrix).
+          const left = NAME_EXCHANGES.map(([ex]) => ex).filter(ex => namesMissingRef.current[ex] || namesPendingRef.current[ex]);
+          const paced = left.filter(ex => !refusedForKey(ex) && !(namesMissingRef.current[ex] && namesMissingRef.current[ex].limited));
+          if (tries >= waits.length || (left.length && !paced.length)) { resolve(false); return; }
           // A 429's own wait when it is longer.
           const until = window.RateLimitWait && window.RateLimitWait.until ? window.RateLimitWait.until() : 0;
           const ms = Math.max(waits[tries++], until ? until - Date.now() + 250 : 0);
           setTimeout(() => {
             if (!wanted()) { resolve(null); return; }
-            loadListingNames().then(namesSettled, namesSettled);
+            loadListingNames(left.length ? paced.filter(ex => !namesPendingRef.current[ex]) : undefined).then(namesSettled, namesSettled);
           }, ms);
         };
         askAux().names.then(namesSettled);
@@ -1808,6 +1876,8 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
     feedCacheRef.current = {};
     divDayCacheRef.current = {};
     capsRef.current = null;
+    capsPagesRef.current = { key: null, pages: new Map() };
+    setCapsProblem(null);
   }, [apiKey]);
 
   React.useEffect(() => {
@@ -2486,37 +2556,138 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
     const all = failedFeeds.map(f => whyOf(failOf(f)));
     return all.length && all.every(w => w === all[0]) ? all[0] : null;
   })();
+  // The feeds asked for that answered: neither failed nor refused. The
+  // holidays refused for an exchange are no feed with nothing in it: "The
+  // other feeds have nothing in this window" stood under a line saying the
+  // holidays are not in the plan. With
+  // none answered, nothing is said to be empty.
+  const answeredFeeds = FEED_ORDER.filter(f => feedStatus[f] && feedStatus[f].state === 'ok'
+    && !(f === 'holidays' && feedStatus[f].refused && feedStatus[f].refused.length));
+  // A refused key or a spent day (401, 402) is the open apps' panel's to
+  // say: a line says only that the feed did not load and points to it. A
+  // plan's refusal (403) is the line's own, with nothing to retry. Anything
+  // else the line names with its reason; "Nothing below is missing data" is
+  // the panel's sentence, never the calendar's.
+  const underPanel = (f) => RLW.hostSaysKey(failOf(f));
+  const planRefused = (f) => { const x = failOf(f); return Boolean(x && x.status === 403 && !x.limited && !x.unreadable); };
   const emptyReason = !loadFailed ? null
+    : emptyAllFailed && failedFeeds.every(underPanel) ? `${failedNames} did not load. See the panel above.`
+    : emptyAllFailed && failedFeeds.every(planRefused) ? `${failedNames} are not included in this plan.`
     : emptyAllFailed && loadFailed === 'all' && failedFeeds.length > 1 ? (
-      explainedAbove
-        ? 'Nothing below is missing data — the requests were not served. See the panel above.'
-        : (sharedWhy && sharedWhy !== NO_ANSWER ? "Couldn't load the calendar: " + sharedWhy.slice(3)
-          : "Couldn't load the calendar right now — the requests were not answered.")
+      sharedWhy && sharedWhy !== NO_ANSWER ? "Couldn't load the calendar: " + sharedWhy.slice(3)
+        : "Couldn't load the calendar right now — the requests were not answered."
     ) : emptyAllFailed ? (
       `${failedNames} did not load`
-      + (explainedAbove ? '. See the panel above.' : (sharedWhy || NO_ANSWER))
-      + (loadFailed === 'some' ? ' The other feeds have nothing in this window.' : '')
+      + (sharedWhy || NO_ANSWER)
+      + (answeredFeeds.length ? ' The other feeds have nothing in this window.' : '')
     ) : (explainedAbove
-      ? 'The feeds named above were not served; the rest have nothing in this window.'
-      : "The feeds named above didn't answer; the rest have nothing in this window.");
-  // The empty list's sentence names the holidays' exchange-details itself
-  // when they are the only feed that failed (data-own-fail, for the open
-  // apps' shell); the other feeds are the panel's to explain.
-  const emptyOwnFail = failedFeeds.length === 1 && failedFeeds[0] === 'holidays' ? 'exchange-hours' : undefined;
+      ? 'The feeds named above were not served' + (answeredFeeds.length ? '; the rest have nothing in this window.' : '.')
+      : "The feeds named above didn't answer" + (answeredFeeds.length ? '; the rest have nothing in this window.' : '.'));
+  // The empty list's sentence names the feeds that failed itself
+  // (data-own-fail, for the open apps' shell).
+  const emptyOwnFail = failedFeeds.map(f => FEED_KIND[f]).join(' ') || 'calendar';
+  // The holidays refused for some exchange: not loaded, and no empty state
+  // says there is nothing ("No upcoming events found" under "Market holidays are not
+  // included in this plan.").
+  const holidaysOut = Boolean(feedStatus.holidays && feedStatus.holidays.state === 'ok' && feedStatus.holidays.refused && feedStatus.holidays.refused.length);
+  const notLoadedFeeds = failedFeeds.concat(holidaysOut ? ['holidays'] : []);
   // A failed feed's line, and the names lists'.
-  const feedLine = (f, what) => `${what || FEED_NAMES[f]} did not load${explainedAbove ? '. See the panel above.' : whyOf(failOf(f))}`;
+  const feedLine = (f, what) => {
+    const w = what || FEED_NAMES[f];
+    if (underPanel(f)) return RLW.panelLine(w);
+    if (planRefused(f)) return `${w} are not included in this plan.`;
+    return `${w} did not load${whyOf(failOf(f))}`;
+  };
   // Which exchanges' names did not load, and why.
+  // Each missing exchange by its own reason: US refused by the plan beside
+  // Frankfurt at 500 read as one refusal for both, with no Try again for
+  // Frankfurt. One sentence per reason; the
+  // host's panel's last.
   const namesLine = (() => {
-    // A refused key or a spent day the host's panel says already: no line
-    // (one failure, one message). The terminal has none: said here.
-    if (!namesProblem || RLW.hostSaysKey(namesProblem.fail)) return '';
-    const ex = namesProblem.exchanges || [];
-    const where = ex.length > 1 ? `${ex.slice(0, -1).join(', ')} and ${ex[ex.length - 1]}` : (ex[0] || '');
-    const f = namesProblem.fail;
+    if (!namesProblem) return '';
+    const listed = (ex) => (ex.length > 1 ? `${ex.slice(0, -1).join(', ')} and ${ex[ex.length - 1]}` : (ex[0] || ''));
+    const fails = namesProblem.fails || {};
+    const groups = [];
+    const groupOf = (kind, words) => {
+      let g = groups.find(x => x.kind === kind && x.words === words);
+      if (!g) { g = { kind, words, ex: [] }; groups.push(g); }
+      return g;
+    };
+    (namesProblem.exchanges || []).forEach((ex) => {
+      const f = fails[ex] || namesProblem.fail;
+      // A refused key or a spent day the host's panel says: only that the
+      // names did not load (one failure, one message). The
+      // terminal has no panel: said here.
+      if (RLW.hostSaysKey(f)) groupOf('panel', '').ex.push(ex);
+      // A plan's refusal (403); a daily 402 is the day's limit, never "not
+      // included in this plan".
+      else if (f && f.status === 403 && !f.limited && !f.unreadable) groupOf('plan', String(f.status)).ex.push(ex);
+      else groupOf('other', RLW.failReason(f).replace(/\.$/, '')).ex.push(ex);
+    });
     const tail = ', so some listings on other exchanges are left out.';
-    if (f && (f.status === 402 || f.status === 403) && !f.limited && !f.unreadable) return `Company names for ${where} are not included in this plan (${f.status})${tail}`;
-    return `Company names for ${where} did not load: ${RLW.failReason(f).replace(/\.$/, '')}${tail}`;
+    const own = groups.filter(g => g.kind !== 'panel');
+    const said = own.map((g, i) => {
+      const end = i === own.length - 1 ? tail : '.';
+      return g.kind === 'plan'
+        ? `Company names for ${listed(g.ex)} are not included in this plan (${g.words})${end}`
+        : `Company names for ${listed(g.ex)} did not load: ${g.words}${end}`;
+    });
+    groups.filter(g => g.kind === 'panel').forEach((g) => { said.push(RLW.panelLine(`Company names for ${listed(g.ex)}`)); });
+    return said.join(' ');
   })();
+  // Try again while any missing list can be asked again: refused lists are
+  // not (namesRefusedRef), and the press asks only the others.
+  const namesRetry = Boolean(namesProblem) && (namesProblem.exchanges || []).some(ex => !isRefusal((namesProblem.fails || {})[ex] || namesProblem.fail));
+  // The market caps that did not come (capsProblem), under the feeds that
+  // order and fold by them: a secondary feed inside the screen -- a plan's
+  // refusal is said with no Try again, the key or the day under a
+  // host's panel points at it, anything else with its reason and
+  // Try again; a part that came is said as a part.
+  // One sentence a reason (capsProblem.groups): the plan's with no Try
+  // again, the key or the day under a host's panel pointing at it (last),
+  // anything else with its reason; the tail on the last of the screen's own.
+  const capsLine = (() => {
+    if (!capsProblem || !namesFeeds.length) return '';
+    const what = capsProblem.part ? 'Part of the market caps' : 'Market caps';
+    const tail = capsProblem.part ? ", so some of a day's biggest reports may not come first." : ", so a day's reports are not ordered by size.";
+    const groups = capsProblem.groups || [{ kind: 'why', failure: capsProblem.failure }];
+    const own = groups.filter(g => g.kind !== 'panel');
+    const said = own.map((g, i) => {
+      const end = i === own.length - 1 ? tail : '.';
+      return g.kind === 'plan'
+        ? `${what} ${capsProblem.part ? 'is' : 'are'} not included in this plan (403)${end}`
+        : `${what} did not load: ${RLW.failReason(g.failure).replace(/\.$/, '')}${end}`;
+    });
+    if (groups.some(g => g.kind === 'panel')) said.push(RLW.panelLine(what));
+    return said.join(' ');
+  })();
+  // Try again while some page can come: never for the plan's refusal, nor
+  // for the key or the day the host's panel says.
+  const capsRetry = Boolean(capsLine) && (capsProblem.groups || []).some(g => g.kind.indexOf('why:') === 0);
+  // Asked again with the feeds on screen, as the names' Try again: their
+  // lists are kept (feedCacheRef), the caps are not.
+  const retryCaps = () => { capsRef.current = null; retryFeeds(namesFeeds); };
+  RLW.useReloadAfterWait(capsLine && capsProblem.failure && capsProblem.failure.limited ? capsProblem.failure : null, () => {
+    capsRef.current = null;
+    if (namesFeeds.length) loadEvents(namesFeeds, { capsOnly: true });
+  }, 'calendar-caps');
+  // The lists at the limit (429): asked again once after the wait, by
+  // themselves, as every panel's reload is (RateLimitWait.useReloadAfterWait:
+  // one repeat per failure, then only Try again or the screen opened again). Taken in, the feeds on screen are drawn again in
+  // full, or the line says what is still missing. Only while a feed that
+  // uses them is on screen (namesFeeds), as the names' own pace stopped when
+  // none was: on Holidays the repeat went out and nothing there could say it
+  // (the open apps' failure matrix).
+  const namesLimited = namesProblem && namesFeeds.length ? (namesProblem.exchanges || []).filter(ex => { const f = (namesProblem.fails || {})[ex]; return Boolean(f && f.limited); }) : [];
+  RLW.useReloadAfterWait(namesLimited.length ? namesProblem.fails[namesLimited[0]] : null, () => {
+    if (!namesLimited.length) return;
+    loadListingNames(namesLimited).then(() => {
+      if (!viewAliveRef.current) return;
+      if (!namesComplete()) { setNamesProblem(namesMissing()); return; }
+      setNamesProblem(false);
+      Object.values(namesRedrawRef.current).forEach((redraw) => { try { redraw(); } catch (_) { /* one feed's trouble */ } });
+    }, () => {});
+  }, 'calendar-names');
   // The exchanges' holidays refused (401, 402, 403): an answer, said once
   // with nothing to retry. One sentence
   // when every exchange was refused alike, else one per exchange.
@@ -2526,8 +2697,11 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
     if (!holidaysRefused.length || !ES || !ES.refusalText) return '';
     const all = ['US', 'LSE', 'TO'];
     const alike = holidaysRefused.length === all.length && holidaysRefused.every(ex => ES.refused(ex) === ES.refused(holidaysRefused[0]));
-    if (alike) return ES.refusalText(holidaysRefused[0], 'Market holidays');
-    return holidaysRefused.map(ex => ES.refusalText(ex, 'Market holidays for ' + ex)).filter(Boolean).join(' ');
+    // Under the open apps' panel (401, 402): "did not load. See the panel
+    // above." -- the Holidays tab is what was refused, and it said nothing
+    // over "No upcoming events found".
+    if (alike) return ES.refusalText(holidaysRefused[0], 'Market holidays', { panel: true });
+    return holidaysRefused.map(ex => ES.refusalText(ex, 'Market holidays for ' + ex, { panel: true })).filter(Boolean).join(' ');
   })();
   // ── One live region for the calendar's failures ──────────────────────
   // Each feed's line, the names line and the empty list's sentence were
@@ -2544,7 +2718,7 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
         ? `Dividends for ${st.days.map(dayLabel).join(', ')}` : null);
     }))
     .concat(namesProblem && namesFeeds.length > 0 ? [namesLine] : [])
-    .concat(holidaysRefusedLine ? [holidaysRefusedLine] : [])
+    .concat(capsLine ? [capsLine] : [])
     .filter(Boolean).join(' '));
   const [liveSummary, setLiveSummary] = React.useState('');
   React.useEffect(() => {
@@ -2552,16 +2726,19 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
     setLiveSummary(failSummary);
   }, [failSummary]);
   // The wait that stopped a feed is over: said once, as on every screen.
-  const limitShown = failedFeeds.some(f => failOf(f) && failOf(f).limited) || Boolean(namesProblem && namesProblem.fail && namesProblem.fail.limited);
+  const limitShown = failedFeeds.some(f => failOf(f) && failOf(f).limited) || Boolean(namesProblem && Object.values(namesProblem.fails || {}).concat([namesProblem.fail]).some(f => f && f.limited));
   const waitWasRef = React.useRef(0);
   React.useEffect(() => {
     const was = waitWasRef.current;
     waitWasRef.current = waitLeft;
     if (was && !waitLeft && limitShown) RLW.announce(RLW.OVER);
   }, [waitLeft, limitShown]);
-  // One Try again for every feed that failed, and the wait under it.
-  const retryAllButton = (pad) => (
-    <button type="button" data-retry-focus="true" aria-disabled={waitLeft ? 'true' : undefined} onClick={() => retryFeeds(failedFeeds)} style={{
+  // One Try again for every feed that failed, and the wait under it. A
+  // plan's refusal (403) is not asked again: Earnings alone at 403 had a
+  // Try again that asked the refused request again. None left: no button.
+  const retryableFeeds = failedFeeds.filter(f => !planRefused(f));
+  const retryAllButton = (pad) => retryableFeeds.length > 0 && (
+    <button type="button" data-retry-focus="true" aria-disabled={waitLeft ? 'true' : undefined} onClick={() => retryFeeds(retryableFeeds)} style={{
       padding: pad, background: waitLeft ? 'transparent' : C3.logoGradient,
       border: waitLeft ? '1px solid ' + (isDark ? 'rgba(255,255,255,0.25)' : 'rgba(0,0,0,0.25)') : 'none',
       borderRadius: '12px', color: waitLeft ? mutedInk : 'white', fontSize: '14px', fontWeight: '600',
@@ -2573,7 +2750,7 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
   // Not a live region: the note counts every second; the press was said
   // once when it was held, by RateLimitWait.
   const allFailedWait = (margin) => rlWait.note && (
-    <p data-wait-note="true" style={{ fontSize: 13, margin, color: isDark ? C3.textDark : C3.textLightTheme }}>{rlWait.note}</p>
+    <p data-wait-note="true" data-own-fail={emptyOwnFail} style={{ fontSize: 13, margin, color: isDark ? C3.textDark : C3.textLightTheme }}>{rlWait.note}</p>
   );
   // One line per feed that did not load, named, each with its own Try again;
   // and, while the list is up, the feeds still on their way.
@@ -2588,11 +2765,12 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
             const what = f === 'dividends' && st.days && st.days.length && divCoverage && !divCoverage.none
               ? `Dividends for ${st.days.map(dayLabel).join(', ')}` : FEED_NAMES[f];
             return (
-              <div key={f} data-feed-problem={f} data-own-fail={f === 'holidays' ? 'exchange-hours' : undefined} style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13, color: mutedInk }}>
+              <div key={f} data-feed-problem={f} data-own-fail={FEED_KIND[f]} data-see-panel={underPanel(f) ? 'true' : undefined} style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13, color: mutedInk }}>
                 {/* Not a live region of its own: the calendar's one
                     (failSummary) reads every feed's line once. */}
                 <span>{feedLine(f, what)}</span>
-                <button type="button" data-retry-focus="true" aria-disabled={waitLeft ? 'true' : undefined}
+                {/* A plan's refusal (403) is not asked again: no Try again. */}
+                {!planRefused(f) && <button type="button" data-retry-focus="true" aria-disabled={waitLeft ? 'true' : undefined}
                   aria-label={`Try again: ${FEED_NAMES[f]}${waitLeft ? ` (in ${waitLeft} s)` : ''}`}
                   onClick={() => retryFeeds([f])} style={{
                     padding: '6px 14px', background: waitLeft ? 'transparent' : C3.logoGradient,
@@ -2601,7 +2779,7 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
                     cursor: waitLeft ? 'not-allowed' : 'pointer',
                   }}>
                   {waitLeft ? `Try again in ${waitLeft} s` : 'Try again'}
-                </button>
+                </button>}
               </div>
             );
           })}
@@ -2610,10 +2788,10 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
       {/* The names lists failed after every retry: what is left out, and a
           Try again that asks for them again. */}
       {namesLine && namesFeeds.length > 0 && (
-        <div data-names-problem="true" data-own-fail="company-names" style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13, color: mutedInk }}>
+        <div data-names-problem="true" data-own-fail="company-names" data-see-panel={RLW.seesPanel(namesLine)} style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13, color: mutedInk }}>
           {/* Read out by the calendar's one live region (failSummary). */}
           <span style={{ flex: '1 1 200px', minWidth: 0 }}>{namesLine}</span>
-          <button type="button" data-retry-focus="true" aria-disabled={waitLeft ? 'true' : undefined}
+          {namesRetry && <button type="button" data-retry-focus="true" aria-disabled={waitLeft ? 'true' : undefined}
             aria-label={`Try again: company names${waitLeft ? ` (in ${waitLeft} s)` : ''}`}
             onClick={() => retryFeeds(namesFeeds)} style={{
               padding: '6px 14px', background: waitLeft ? 'transparent' : C3.logoGradient,
@@ -2622,15 +2800,33 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
               cursor: waitLeft ? 'not-allowed' : 'pointer',
             }}>
             {waitLeft ? `Try again in ${waitLeft} s` : 'Try again'}
-          </button>
+          </button>}
         </div>
       )}
-      {/* Read out by the calendar's one live region (failSummary). */}
+      {/* The market caps that did not come (capsLine), with Try again
+          unless refused. Read out by the calendar's one live region. */}
+      {capsLine && (
+        <div data-caps-problem="true" data-own-fail="screener" data-see-panel={RLW.seesPanel(capsLine)} style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13, color: mutedInk }}>
+          <span style={{ flex: '1 1 200px', minWidth: 0 }}>{capsLine}</span>
+          {capsRetry && <button type="button" data-retry-focus="true" aria-disabled={waitLeft ? 'true' : undefined}
+            aria-label={`Try again: market caps${waitLeft ? ` (in ${waitLeft} s)` : ''}`}
+            onClick={retryCaps} style={{
+              padding: '6px 14px', background: waitLeft ? 'transparent' : C3.logoGradient,
+              border: waitLeft ? '1px solid ' + (isDark ? 'rgba(255,255,255,0.25)' : 'rgba(0,0,0,0.25)') : 'none',
+              borderRadius: 10, color: waitLeft ? mutedInk : 'white', fontSize: 13, fontWeight: 600,
+              cursor: waitLeft ? 'not-allowed' : 'pointer',
+            }}>
+            {waitLeft ? `Try again in ${waitLeft} s` : 'Try again'}
+          </button>}
+        </div>
+      )}
+      {/* A live region of its own, said once: it was said by the calendar's
+          one region too, and read twice. */}
       {holidaysRefusedLine && (
-        <p data-holidays-refused="true" data-own-fail="exchange-hours" style={{ fontSize: 13, margin: '0 0 12px', color: mutedInk }}>{holidaysRefusedLine}</p>
+        <p role="status" data-holidays-refused="true" data-own-fail="exchange-hours" data-see-panel={RLW.seesPanel(holidaysRefusedLine)} style={{ fontSize: 13, margin: '0 0 12px', color: mutedInk }}>{holidaysRefusedLine}</p>
       )}
       {rlWait.note && !emptyAllFailed && (
-        <p data-wait-note="true" style={{ fontSize: 13, margin: '0 0 12px', color: isDark ? C3.textDark : C3.textLightTheme }}>{rlWait.note}</p>
+        <p data-wait-note="true" data-own-fail={emptyOwnFail} style={{ fontSize: 13, margin: '0 0 12px', color: isDark ? C3.textDark : C3.textLightTheme }}>{rlWait.note}</p>
       )}
       {!loading && pendingFeeds.length > 0 && (
         <p role="status" style={{ fontSize: 12, margin: '0 0 12px', color: mutedInk }}>
@@ -2714,11 +2910,13 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
             screen used to leave that difference unexplained. */}
         {divCoverage && (filter === 'all' || filter === 'dividends') && (
           <div style={{ fontSize: '11px', marginBottom: '12px', color: isDark ? C3.textMutedDark : C3.textMutedLight }}>
+            {/* The days that did not load name the dividends' failure
+                (data-own-fail); the rest of the note is always there. */}
             {divCoverage.none
               ? 'Dividends are not loaded for this month (one request per day); pick the Dividends filter to load two weeks of it.'
-              : divCoverage.grid
-                ? `Dividends cover ${divCoverage.from} – ${divCoverage.to}${divMissedNote}; the other feeds cover the whole month.`
-                : `Dividends cover ${divCoverage.from} – ${divCoverage.to}${divMissedNote}; earnings, splits and IPOs reach 90 days, economic events one week.`}
+              : <>{`Dividends cover ${divCoverage.from} – ${divCoverage.to}`}{divMissedNote ? <span data-own-fail="dividends">{divMissedNote}</span> : null}{divCoverage.grid
+                ? '; the other feeds cover the whole month.'
+                : '; earnings, splits and IPOs reach 90 days, economic events one week.'}</>}
           </div>
         )}
 
@@ -2954,12 +3152,20 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
               <div style={{ textAlign: 'center', padding: '48px 0' }}>
                 {/* Read out by the calendar's one live region
                     (failSummary); the button below counts the wait. */}
-                <p data-own-fail={emptyOwnFail} style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginBottom: '16px', fontSize: '14px' }}>
+                <p data-own-fail={emptyOwnFail} data-see-panel={RLW.seesPanel(emptyReason)} style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginBottom: '16px', fontSize: '14px' }}>
                   {emptyReason}
                 </p>
                 {emptyAllFailed && retryAllButton('12px 24px')}
                 {emptyAllFailed && allFailedWait('12px 0 0')}
               </div>
+              ) : holidaysOut && scope === 'all' ? (
+              // The holidays refused: their line above says so. Nothing is
+              // said to be empty but the feeds that answered, if any did.
+              answeredFeeds.length ? (
+                <p data-cal-empty-loaded="true" style={{ textAlign: 'center', padding: '48px 0', color: isDark ? C3.textMutedDark : C3.textMutedLight, fontSize: '14px' }}>
+                  No events in this window from the feeds that loaded.
+                </p>
+              ) : null
               ) : (
               <div style={{ textAlign: 'center', padding: '48px 0' }}>
                 <Icon name="calendar" size={48} color={isDark ? C3.textMutedDark : C3.textMutedLight} />
@@ -3107,14 +3313,14 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
                 feed, not a line per feed. */}
             {emptyAllFailed ? (
               <div data-grid-all-failed="true" style={{ textAlign: 'center', margin: '0 0 12px' }}>
-                <p data-own-fail={emptyOwnFail} style={{ fontSize: '13px', margin: '0 0 8px', color: isDark ? C3.textMutedDark : C3.textMutedLight }}>
+                <p data-own-fail={emptyOwnFail} data-see-panel={RLW.seesPanel(emptyReason)} style={{ fontSize: '13px', margin: '0 0 8px', color: isDark ? C3.textMutedDark : C3.textMutedLight }}>
                   {emptyReason}{loadFailed === 'all' && !explainedAbove ? ' Empty days below are not "no events".' : ''}
                 </p>
                 {retryAllButton('8px 18px')}
                 {allFailedWait('8px 0 0')}
               </div>
             ) : loadFailed && events.length === 0 && (
-              <p style={{ textAlign: 'center', fontSize: '13px', margin: '0 0 12px', color: isDark ? C3.textMutedDark : C3.textMutedLight }}>
+              <p data-own-fail={emptyOwnFail} style={{ textAlign: 'center', fontSize: '13px', margin: '0 0 12px', color: isDark ? C3.textMutedDark : C3.textMutedLight }}>
                 The feeds named above did not answer for this month.
               </p>
             )}
@@ -3276,13 +3482,15 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
                   {/* A day of a month whose feeds did not load is not a day
                       with no events: the grid above says so, and the day's
                       panel said "No events on this day" under it. */}
-                  {dayEvents.length === 0
-                    ? <div style={{ padding: '16px 0', textAlign: 'center', color: isDark ? C3.textMutedDark : C3.textMutedLight, fontSize: 13 }}>{loadFailed === 'all'
+                  {/* The holidays refused are not loaded either. */}
+                  {dayEvents.length === 0 && notLoadedFeeds.length
+                    ? <div data-own-fail={notLoadedFeeds.map(f => FEED_KIND[f]).join(' ')} style={{ padding: '16px 0', textAlign: 'center', color: isDark ? C3.textMutedDark : C3.textMutedLight, fontSize: 13 }}>{loadFailed === 'all' || !answeredFeeds.length
                       // One feed is named, in the singular: "the feeds above"
                       // stood for the one that failed.
-                      ? `Nothing loaded for this day: ${failedFeeds.length === 1 ? `${FEED_NAMES[failedFeeds[0]] || failedFeeds[0]} did not load` : 'the feeds above did not load'}. That is not the same as no events.`
-                      : loadFailed ? `No events on this day in the feeds that loaded. Not loaded: ${failedFeeds.map(f => FEED_NAMES[f] || f).join(', ')}.`
-                      : 'No events on this day'}</div>
+                      ? `Nothing loaded for this day: ${notLoadedFeeds.length === 1 ? `${FEED_NAMES[notLoadedFeeds[0]] || notLoadedFeeds[0]} did not load` : 'the feeds above did not load'}. That is not the same as no events.`
+                      : `No events on this day in the feeds that loaded. Not loaded: ${notLoadedFeeds.map(f => FEED_NAMES[f] || f).join(', ')}.`}</div>
+                    : dayEvents.length === 0
+                    ? <div style={{ padding: '16px 0', textAlign: 'center', color: isDark ? C3.textMutedDark : C3.textMutedLight, fontSize: 13 }}>No events on this day</div>
                     : (() => {
                       // Every company now stays in the calendar, so a busy
                       // day holds over a thousand: twenty first, like the feed.
