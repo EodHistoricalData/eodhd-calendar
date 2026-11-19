@@ -2556,6 +2556,21 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
     const all = failedFeeds.map(f => whyOf(failOf(f)));
     return all.length && all.every(w => w === all[0]) ? all[0] : null;
   })();
+  // The failed feeds by their reason, one sentence each, when the reasons
+  // differ: "the requests were not answered" stood for the limit on the
+  // feeds beside EODHD's error on the holidays, and for an error beside a
+  // dropped connection -- EODHD had answered.
+  const byWhy = () => {
+    const groups = [];
+    failedFeeds.forEach((f) => {
+      const why = whyOf(failOf(f));
+      let g = groups.find(x => x.why === why);
+      if (!g) { g = { why, names: [] }; groups.push(g); }
+      g.names.push(FEED_NAMES[f]);
+    });
+    const listed = (n) => (n.length > 1 ? `${n.slice(0, -1).join(', ')} and ${n[n.length - 1]}` : n[0]);
+    return groups.map(g => `${listed(g.names)} did not load${g.why}`).join(' ');
+  };
   // The feeds asked for that answered: neither failed nor refused. The
   // holidays refused for an exchange are no feed with nothing in it: "The
   // other feeds have nothing in this window" stood under a line saying the
@@ -2575,7 +2590,8 @@ window.EventsCalendarView = ({ apiKey, watchlist = [], portfolio = [], onClose, 
     : emptyAllFailed && failedFeeds.every(planRefused) ? `${failedNames} are not included in this plan.`
     : emptyAllFailed && loadFailed === 'all' && failedFeeds.length > 1 ? (
       sharedWhy && sharedWhy !== NO_ANSWER ? "Couldn't load the calendar: " + sharedWhy.slice(3)
-        : "Couldn't load the calendar right now — the requests were not answered."
+        : sharedWhy ? "Couldn't load the calendar right now — the requests were not answered."
+        : "Couldn't load the calendar. " + byWhy()
     ) : emptyAllFailed ? (
       `${failedNames} did not load`
       + (sharedWhy || NO_ANSWER)

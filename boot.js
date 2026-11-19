@@ -11,7 +11,8 @@ window.APP_META = {
   "storage": [],
   "lineKinds": [
     "exchange-hours",
-    "company-names"
+    "company-names",
+    "screener"
   ]
 };
 
